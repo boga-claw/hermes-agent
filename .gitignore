@@ -73,3 +73,6 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# Compiled plugin dashboard artifacts — built at deploy time, not tracked
+plugins/hermes-achievements/dashboard/dist/
+plugins/kanban/dashboard/dist/
