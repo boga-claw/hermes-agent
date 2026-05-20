@@ -250,13 +250,43 @@ def _run_one_file(
     return file, rc, output
 
 
+def _format_file(file: Path, repo_root: Path) -> str:
+    """Render a test-file path for display: strip the repo-root prefix
+    when possible so output reads ``tests/acp/test_auth.py`` instead of
+    ``/home/runner/work/hermes-agent/hermes-agent/tests/acp/test_auth.py``.
+
+    Falls back to the absolute path for anything outside the repo root.
+    """
+    try:
+        return str(file.resolve().relative_to(repo_root.resolve()))
+    except ValueError:
+        return str(file)
+
+
 def _print_progress(
-    done: int, total: int, file: Path, rc: int, dur: float
+    done: int,
+    total: int,
+    file: Path,
+    rc: int,
+    dur: float,
+    repo_root: Path,
+    passed: int,
+    failed: int,
 ) -> None:
-    """Single-line live progress, replacing previous lines."""
+    """Single-line live progress.
+
+    Format:
+      [done/total  ✓passed ✗failed ⏲inflight] status path (Xs)
+
+    The running tally lets you see at a glance how many files succeeded /
+    failed / are still in flight without scanning previous output.
+    """
     status = "✓" if rc == 0 else "✗"
-    pct = 100 * done // total
-    msg = f"[{done:>4}/{total}] {pct:>3}% {status} {file} ({dur:.1f}s)"
+    in_flight = total - done
+    msg = (
+        f"[{done:>4}/{total}  ✓{passed} ✗{failed} ⏲{in_flight}] "
+        f"{status} {_format_file(file, repo_root)} ({dur:.1f}s)"
+    )
     # Truncate to terminal width if available (no clobbering ANSI lines).
     try:
         cols = os.get_terminal_size().columns
@@ -357,23 +387,37 @@ def main() -> int:
     failures: List[Tuple[Path, str]] = []
     started = time.monotonic()
     done_count = 0
+    pass_count = 0
+    fail_count = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str]]") -> None:
-        nonlocal done_count
+        nonlocal done_count, pass_count, fail_count
         try:
             fpath, rc, output = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
             with lock:
                 done_count += 1
+                fail_count += 1
                 failures.append((file, f"runner crashed: {exc!r}"))
-                _print_progress(done_count, len(files), file, 1, time.monotonic() - started_at)
+                _print_progress(
+                    done_count, len(files), file, 1,
+                    time.monotonic() - started_at,
+                    repo_root, pass_count, fail_count,
+                )
             return
         with lock:
             done_count += 1
-            _print_progress(done_count, len(files), fpath, rc, time.monotonic() - started_at)
-            if rc != 0:
+            if rc == 0:
+                pass_count += 1
+            else:
+                fail_count += 1
                 failures.append((fpath, output))
+            _print_progress(
+                done_count, len(files), fpath, rc,
+                time.monotonic() - started_at,
+                repo_root, pass_count, fail_count,
+            )
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
@@ -401,12 +445,12 @@ def main() -> int:
         print("=== Failure output ===")
         for file, output in failures:
             print()
-            print(f"--- {file} ---")
+            print(f"--- {_format_file(file, repo_root)} ---")
             print(output.rstrip())
         print()
         print("=== Failed files ===")
         for file, _ in failures:
-            print(f"  {file}")
+            print(f"  {_format_file(file, repo_root)}")
         return 1
 
     return 0
