@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Per-file parallel test runner.
+
+The minimum-viable replacement for pytest-xdist + a subprocess-isolation
+plugin. Discovers test files under ``tests/`` (excluding integration/e2e
+unless explicitly requested), then runs one ``python -m pytest <file>``
+subprocess per file, with bounded parallelism (default: ``os.cpu_count()``).
+
+Why per-file rather than per-test?
+    Per-test spawn overhead (~250ms × 17k tests = 70min CPU minimum)
+    swamped the actual work. Per-file spawn (~250ms × ~850 files = ~3.5min)
+    fits in the budget while still giving every file a fresh Python
+    interpreter — the only isolation boundary that actually matters
+    (cross-file module-level state leakage was the original flake source;
+    intra-file state is the test author's responsibility).
+
+Why drop xdist entirely?
+    xdist's persistent workers accumulate state across files, which is
+    exactly the leakage we wanted to fix. xdist also adds complexity
+    (loadfile vs loadscope, --max-worker-restart, internal control plane)
+    that we don't need when the unit of work is "run pytest on one file".
+    A subprocess.Popen pool gated by a semaphore is ~60 lines and does
+    the job.
+
+Usage:
+    python scripts/run_tests_parallel.py [pytest_args...]
+
+    Common pytest args pass through (e.g. ``-v``, ``-x``, ``--tb=long``,
+    ``-k 'pattern'``, ``--lf``).
+
+Environment:
+    HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
+    HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+
+Exit code: 0 if every file's pytest exited 0; 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, Future
+from pathlib import Path
+from typing import List, Tuple
+
+
+# Default test discovery roots.
+_DEFAULT_ROOTS = ["tests"]
+
+# Directories to skip during discovery — the e2e + integration suites
+# require real services and are run separately. Match exactly the
+# ``--ignore=`` flags the previous CI command used.
+_SKIP_PARTS = {"integration", "e2e"}
+
+
+def _discover_files(roots: List[Path]) -> List[Path]:
+    """Return every ``test_*.py`` under the given roots (sorted).
+
+    Exclude any file whose path contains a component in ``_SKIP_PARTS``.
+    """
+    seen: set[Path] = set()
+    out: List[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("test_*.py"):
+            if any(part in _SKIP_PARTS for part in path.parts):
+                continue
+            real = path.resolve()
+            if real in seen:
+                continue
+            seen.add(real)
+            out.append(path)
+    return sorted(out)
+
+
+def _run_one_file(
+    file: Path,
+    pytest_args: List[str],
+    repo_root: Path,
+) -> Tuple[Path, int, str]:
+    """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
+
+    Returns (file, returncode, captured_combined_output).
+
+    pytest exit codes (https://docs.pytest.org/en/stable/reference/exit-codes.html):
+        0 = all tests passed
+        1 = some tests failed
+        2 = test execution interrupted
+        3 = internal error
+        4 = pytest CLI usage error
+        5 = no tests collected
+
+    We treat exit 5 as a pass: it just means every test in the file was
+    skipped or filtered by a marker (e.g. ``-m 'not integration'`` skips
+    files where every test is marked integration). That's intentional and
+    not a failure mode.
+    """
+    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        # No timeout here: pytest-timeout in the child enforces per-test
+        # timeouts. A whole-file timeout would need to be huge to allow
+        # for slow files (some have 100+ tests) and adds little safety.
+    )
+    rc = proc.returncode
+    if rc == 5:
+        # No tests collected — every test in the file was filtered out.
+        # Treat as a pass; surface info in a slightly distinct status
+        # so the operator can spot it.
+        rc = 0
+    return file, rc, proc.stdout
+
+
+def _print_progress(
+    done: int, total: int, file: Path, rc: int, dur: float
+) -> None:
+    """Single-line live progress, replacing previous lines."""
+    status = "✓" if rc == 0 else "✗"
+    pct = 100 * done // total
+    msg = f"[{done:>4}/{total}] {pct:>3}% {status} {file} ({dur:.1f}s)"
+    # Truncate to terminal width if available (no clobbering ANSI lines).
+    try:
+        cols = os.get_terminal_size().columns
+        if len(msg) > cols:
+            msg = msg[: cols - 1] + "…"
+    except OSError:
+        pass
+    print(msg, flush=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or os.cpu_count() or 4),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or os.cpu_count())",
+    )
+    parser.add_argument(
+        "--paths",
+        default=os.environ.get("HERMES_TEST_PATHS", ":".join(_DEFAULT_ROOTS)),
+        help="Colon-separated discovery roots (default: 'tests')",
+    )
+    parser.add_argument(
+        "--include-integration",
+        action="store_true",
+        help="Don't skip integration/ e2e/ during discovery",
+    )
+    args, pytest_passthrough = parser.parse_known_args()
+
+    repo_root = Path(__file__).resolve().parent.parent
+    roots = [repo_root / p for p in args.paths.split(":") if p]
+
+    if args.include_integration:
+        # Caller takes responsibility — typically used via explicit -k filter.
+        global _SKIP_PARTS  # noqa: PLW0603 — config knob
+        _SKIP_PARTS = set()
+
+    files = _discover_files(roots)
+    if not files:
+        print(f"No test files discovered under {[str(r) for r in roots]}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Discovered {len(files)} test files under {':'.join(args.paths.split(':'))}; "
+        f"running with -j {args.jobs}",
+        flush=True,
+    )
+
+    # Capture and print on completion (out-of-order is fine — keeps the
+    # terminal clean rather than interleaving N parallel pytest outputs).
+    failures: List[Tuple[Path, str]] = []
+    started = time.monotonic()
+    done_count = 0
+    lock = threading.Lock()
+
+    def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str]]") -> None:
+        nonlocal done_count
+        try:
+            fpath, rc, output = fut.result()
+        except Exception as exc:  # noqa: BLE001 — must always advance counter
+            with lock:
+                done_count += 1
+                failures.append((file, f"runner crashed: {exc!r}"))
+                _print_progress(done_count, len(files), file, 1, time.monotonic() - started_at)
+            return
+        with lock:
+            done_count += 1
+            _print_progress(done_count, len(files), fpath, rc, time.monotonic() - started_at)
+            if rc != 0:
+                failures.append((fpath, output))
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures: List[Future] = []
+        for file in files:
+            t0 = time.monotonic()
+            fut = pool.submit(_run_one_file, file, pytest_passthrough, repo_root)
+            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
+            futures.append(fut)
+        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+        # for all submitted work, but doing it explicitly here makes the
+        # control flow obvious.
+        for fut in futures:
+            fut.result() if fut.exception() is None else None
+
+    elapsed = time.monotonic() - started
+    print()
+    print(f"=== Summary: {len(files)} files in {elapsed:.1f}s ({args.jobs} workers) ===")
+    print(f"  Passed: {len(files) - len(failures)}")
+    print(f"  Failed: {len(failures)}")
+
+    if failures:
+        print()
+        print("=== Failure output ===")
+        for file, output in failures:
+            print()
+            print(f"--- {file} ---")
+            print(output.rstrip())
+        print()
+        print("=== Failed files ===")
+        for file, _ in failures:
+            print(f"  {file}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

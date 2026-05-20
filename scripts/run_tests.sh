@@ -3,29 +3,32 @@
 # `pytest` directly to guarantee your local run matches CI behavior.
 #
 # What this script enforces:
-#   * -n 4 xdist workers (CI has 4 cores; -n auto diverges locally)
+#   * Per-file isolation via scripts/run_tests_parallel.py — each test
+#     file runs in its own freshly-spawned `python -m pytest <file>`
+#     subprocess. No xdist, no shared workers, no module-level leakage
+#     between files.
 #   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
 #   * Credential env vars blanked (conftest.py also does this, but this
-#     is belt-and-suspenders for anyone running `pytest` outside of
-#     our conftest path — e.g. calling pytest on a single file)
-#   * Proper venv activation
+#     is belt-and-suspenders for anyone running pytest outside our
+#     conftest path — e.g. on a single file)
+#   * Proper venv activation (probes .venv, venv, then ~/.hermes/...)
 #
 # Usage:
-#   scripts/run_tests.sh                     # full suite
-#   scripts/run_tests.sh tests/agent/        # one directory
-#   scripts/run_tests.sh tests/agent/test_foo.py::TestClass::test_method
-#   scripts/run_tests.sh --tb=long -v        # pass-through pytest args
+#   scripts/run_tests.sh                     # full suite, parallel
+#   scripts/run_tests.sh -j 4                # cap parallelism at 4
+#   scripts/run_tests.sh tests/agent/test_foo.py  # one file, serial
+#   scripts/run_tests.sh -- --tb=long -v     # pass-through pytest args
+#
+# When given an explicit file path (a single .py argument), this delegates
+# directly to `python -m pytest <file>` — no parallel runner overhead.
 
 set -euo pipefail
 
 # ── Locate repo root ────────────────────────────────────────────────────────
-# Works whether this is the main checkout or a worktree.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Activate venv ───────────────────────────────────────────────────────────
-# Prefer a .venv in the current tree, fall back to the main checkout's venv
-# (useful for worktrees where we don't always duplicate the venv).
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
   if [ -f "$candidate/bin/activate" ]; then
@@ -40,20 +43,6 @@ if [ -z "$VENV" ]; then
 fi
 
 PYTHON="$VENV/bin/python"
-
-# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
-if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
-  echo "→ installing pytest-split into $VENV"
-  if command -v uv >/dev/null 2>&1; then
-    uv pip install --python "$PYTHON" --quiet "pytest-split>=0.9,<1"
-  elif "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
-  else
-    echo "error: neither uv nor pip is available in $VENV — pytest-split is missing" >&2
-    echo "  fix: run  uv pip install -e \".[dev]\"  from $REPO_ROOT" >&2
-    exit 1
-  fi
-fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────
 # Mirror what CI does in .github/workflows/tests.yml + what conftest.py does.
@@ -88,11 +77,6 @@ export LC_ALL=C.UTF-8
 export PYTHONHASHSEED=0
 
 # ── Live-gateway test guard (developer machines) ────────────────────────────
-# If a system-wide hermes pytest_live_guard plugin is installed at
-# $HOME/.hermes/pytest_live_guard.py, force-load it here so every test run
-# from this script gets the protection regardless of which worktree is
-# checked out (in-tree tests/conftest.py guard may be missing on stale
-# branches). Harmless on CI / fresh machines that don't have the file.
 if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   case ":${PYTHONPATH:-}:" in
     *":$HOME/.hermes:"*) ;;
@@ -103,32 +87,19 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   fi
 fi
 
-# ── Worker count ────────────────────────────────────────────────────────────
-# CI uses `-n auto` on ubuntu-latest which gives 4 workers. A 20-core
-# workstation with `-n auto` gets 20 workers and exposes test-ordering
-# flakes that CI will never see. Pin to 4 so local matches CI.
-WORKERS="${HERMES_TEST_WORKERS:-4}"
-
-# ── Run pytest ──────────────────────────────────────────────────────────────
+# ── Run ─────────────────────────────────────────────────────────────────────
 cd "$REPO_ROOT"
 
-# If the first argument starts with `-` treat all args as pytest flags;
-# otherwise treat them as test paths.
-ARGS=("$@")
+# Special-case: if the user passed a single .py file (or :: nodeid),
+# just run pytest directly on it — the parallel runner adds no value
+# for a one-file invocation and the direct path is faster + has full
+# pytest output piping.
+if [ "$#" -eq 1 ] && [[ "$1" == *.py* ]]; then
+  echo "▶ pytest $1 (single-file direct mode)"
+  exec "$PYTHON" -m pytest "$1"
+fi
 
-echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
+echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
-# -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-# We re-add --timeout/--timeout-method here because pyproject.toml's
-# addopts is wiped above. The 60s cap is essential: see pyproject.toml
-# for why (suite deadlocks at session teardown without it).
-exec "$PYTHON" -m pytest \
-  -o "addopts=" \
-  -n "$WORKERS" \
-  --timeout=30 \
-  --timeout-method=signal \
-  --ignore=tests/integration \
-  --ignore=tests/e2e \
-  -m "not integration" \
-  "${ARGS[@]}"
+exec "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
