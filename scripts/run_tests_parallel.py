@@ -63,6 +63,64 @@ _SKIP_PARTS = {"integration", "e2e"}
 _DEFAULT_FILE_TIMEOUT_SECONDS = 600.0  # 10 minutes
 
 
+def _count_tests(
+    files: List[Path], repo_root: Path, pytest_passthrough: List[str]
+) -> dict[Path, int]:
+    """Run ``pytest --co -q`` once to count individual tests per file.
+
+    Returns a mapping ``{file_path: test_count}``. Files with zero
+    collected tests are omitted from the dict (not an error — e.g. the
+    file only defines fixtures / conftest helpers).
+
+    This is a single subprocess call (~2-5s for ~1k files) that gives
+    us the total test count for the discovery announcement and
+    per-file counts for the progress lines.
+
+    ``--ignore`` flags for directories in ``_SKIP_PARTS`` are added
+    automatically so that pytest's own collection machinery (conftest
+    walking, directory traversal) doesn't pull in tests we intend to
+    skip — matching what the per-file runs will actually execute.
+    """
+    # Build --ignore flags for skipped dirs so the --co collection
+    # mirrors what we'll actually run (not what pytest might find via
+    # conftest walking or directory traversal).
+    ignore_args: List[str] = []
+    for root in [repo_root / p for p in _DEFAULT_ROOTS]:
+        for part in _SKIP_PARTS:
+            d = root / part
+            if d.is_dir():
+                ignore_args.extend(["--ignore", str(d)])
+
+    cmd = [
+        sys.executable, "-m", "pytest",
+        "--co", "-q",
+        *ignore_args,
+        *[str(f) for f in files],
+        *pytest_passthrough,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+
+    counts: dict[Path, int] = {}
+    for line in result.stdout.splitlines():
+        # Lines look like: tests/acp/test_auth.py::TestClass::test_name
+        if "::" not in line:
+            continue
+        file_part = line.split("::", 1)[0]
+        key = repo_root / file_part
+        counts[key] = counts.get(key, 0) + 1
+
+    return counts
+
+
 def _discover_files(roots: List[Path]) -> List[Path]:
     """Return every ``test_*.py`` under the given roots (sorted).
 
@@ -264,28 +322,33 @@ def _format_file(file: Path, repo_root: Path) -> str:
 
 
 def _print_progress(
-    done: int,
-    total: int,
+    tests_done: int,
+    total_tests: int,
     file: Path,
     rc: int,
     dur: float,
     repo_root: Path,
-    passed: int,
-    failed: int,
+    files_passed: int,
+    files_failed: int,
+    files_in_flight: int,
+    test_counts: dict[Path, int],
 ) -> None:
     """Single-line live progress.
 
     Format:
-      [done/total  ✓passed ✗failed ⏲inflight] status path (Xs)
+      [done_tests/total_tests  p%  ✓files_passed ✗files_failed ⏱files_in_flight] status path (N tests, Xs)
 
-    The running tally lets you see at a glance how many files succeeded /
-    failed / are still in flight without scanning previous output.
+    The primary counter is tests (not files) so the bar moves
+    proportionally to real work, not per-file overhead.
     """
     status = "✓" if rc == 0 else "✗"
-    in_flight = total - done
+    pct = (tests_done / total_tests * 100) if total_tests else 0
+    n_tests = test_counts.get(file, 0)
+    test_str = f"{n_tests} tests, " if n_tests else ""
     msg = (
-        f"[{done:>4}/{total}  ✓{passed} ✗{failed} ⏲{in_flight}] "
-        f"{status} {_format_file(file, repo_root)} ({dur:.1f}s)"
+        f"[{tests_done:>5}/{total_tests}  {pct:5.1f}%  "
+        f"✓{files_passed} ✗{files_failed} ⏱{files_in_flight}] "
+        f"{status} {_format_file(file, repo_root)} ({test_str}{dur:.1f}s)"
     )
     # Truncate to terminal width if available (no clobbering ANSI lines).
     try:
@@ -295,6 +358,37 @@ def _print_progress(
     except OSError:
         pass
     print(msg, flush=True)
+
+
+def _print_inline_failure(
+    file: Path, output: str, repo_root: Path, pytest_passthrough: List[str]
+) -> None:
+    """Print a compact failure summary immediately when a file fails.
+
+    Shows the tail of the pytest output (the failure section with stack
+    traces) and a ready-to-run repro command, so the developer doesn't
+    have to wait for the full run to finish before seeing what broke.
+    """
+    rel = _format_file(file, repo_root)
+    # Build a repro command the developer can copy-paste.
+    passthrough_str = " ".join(pytest_passthrough) if pytest_passthrough else ""
+    repro = f"python -m pytest {rel}"
+    if passthrough_str:
+        repro += f" {passthrough_str}"
+
+    # Grab just the failure lines (last ~30 lines of pytest output —
+    # typically the FAILED summary + short test info).
+    lines = output.rstrip().splitlines()
+    tail = "\n".join(lines[-30:])
+
+    print(flush=True)
+    print(f"  ╔╍ Failed: {rel} ╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    for line in tail.splitlines():
+        print(f"  ║ {line}", flush=True)
+    print(f"  ║", flush=True)
+    print(f"  ║  Repro: {repro}", flush=True)
+    print(f"  ╚╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍", flush=True)
+    print(flush=True)
 
 
 def main() -> int:
@@ -375,8 +469,12 @@ def main() -> int:
         print(f"No test files discovered under {[str(r) for r in roots]}", file=sys.stderr)
         return 1
 
+    # Count individual tests per file via a single pytest --co pass.
+    test_counts = _count_tests(files, repo_root, pytest_passthrough)
+    total_tests = sum(test_counts.values())
+
     print(
-        f"Discovered {len(files)} test files under "
+        f"Discovered {len(files)} test files ({total_tests} tests) under "
         f"{[str(r.relative_to(repo_root)) if r.is_relative_to(repo_root) else str(r) for r in roots]}; "
         f"running with -j {args.jobs}",
         flush=True,
@@ -386,38 +484,46 @@ def main() -> int:
     # terminal clean rather than interleaving N parallel pytest outputs).
     failures: List[Tuple[Path, str]] = []
     started = time.monotonic()
-    done_count = 0
+    files_done = 0
+    tests_done = 0
     pass_count = 0
     fail_count = 0
     lock = threading.Lock()
 
     def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str]]") -> None:
-        nonlocal done_count, pass_count, fail_count
+        nonlocal files_done, tests_done, pass_count, fail_count
+        n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output = fut.result()
         except Exception as exc:  # noqa: BLE001 — must always advance counter
             with lock:
-                done_count += 1
+                files_done += 1
+                tests_done += n_tests
                 fail_count += 1
                 failures.append((file, f"runner crashed: {exc!r}"))
                 _print_progress(
-                    done_count, len(files), file, 1,
+                    tests_done, total_tests, file, 1,
                     time.monotonic() - started_at,
                     repo_root, pass_count, fail_count,
+                    len(files) - files_done, test_counts,
                 )
             return
         with lock:
-            done_count += 1
+            files_done += 1
+            tests_done += n_tests
             if rc == 0:
                 pass_count += 1
             else:
                 fail_count += 1
                 failures.append((fpath, output))
             _print_progress(
-                done_count, len(files), fpath, rc,
+                tests_done, total_tests, fpath, rc,
                 time.monotonic() - started_at,
                 repo_root, pass_count, fail_count,
+                len(files) - files_done, test_counts,
             )
+            if rc != 0:
+                _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
@@ -436,7 +542,8 @@ def main() -> int:
 
     elapsed = time.monotonic() - started
     print()
-    print(f"=== Summary: {len(files)} files in {elapsed:.1f}s ({args.jobs} workers) ===")
+    pct = (tests_done / total_tests * 100) if total_tests else 0
+    print(f"=== Summary: {len(files)} files ({total_tests} tests, {pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
     print(f"  Passed: {len(files) - len(failures)}")
     print(f"  Failed: {len(failures)}")
 
