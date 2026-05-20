@@ -306,8 +306,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or os.cpu_count() or 4),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or os.cpu_count())",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
     )
     parser.add_argument(
         "--paths",
