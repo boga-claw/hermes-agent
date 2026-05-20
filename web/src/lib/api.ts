@@ -341,6 +341,15 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  // Agent status polling
+  getAgentStatus: () =>
+    fetchJSON<AgentStatus[]>("/api/agents/status"),
+  updateAgentStatus: (slug: string, status: AgentStatusUpdateRequest) =>
+    fetchJSON<{ ok: boolean; ministry_slug: string; status: string }>(
+      `/api/agents/status/${slug}`,
+      { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(status) },
+    ),
 };
 
 export interface ActionResponse {
@@ -818,3 +827,19 @@ export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
 }
+
+// Agent activity status
+export interface AgentStatus {
+  ministry_slug: string;
+  status: "active" | "idle";
+  updated_at: number;
+}
+
+export interface AgentStatusUpdateRequest {
+  status: "active" | "idle";
+}
+
+// Polling interval for agent status
+const AGENT_STATUS_POLL_INTERVAL_MS = 5000;
+
+// api method additions to the api object below

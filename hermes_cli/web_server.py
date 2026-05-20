@@ -2740,6 +2740,58 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
 
 
 # ---------------------------------------------------------------------------
+# Agent activity status endpoints
+# ---------------------------------------------------------------------------
+
+def _get_kanban_db_path():
+    return str(get_hermes_home() / "kanban.db")
+
+
+class AgentStatusUpdate(BaseModel):
+    status: str
+
+
+@app.get("/api/agents/status")
+async def get_agents_status():
+    """Return all ministry agent statuses."""
+    import sqlite3
+    db_path = _get_kanban_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ministry_slug, status, updated_at FROM agent_status ORDER BY ministry_slug"
+        ).fetchall()
+        conn.close()
+        return [{"ministry_slug": r["ministry_slug"], "status": r["status"], "updated_at": r["updated_at"]} for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/agents/status/{slug}")
+async def update_agent_status(slug: str, body: AgentStatusUpdate):
+    """Update a ministry's agent status (active/idle)."""
+    if body.status not in ("active", "idle"):
+        raise HTTPException(status_code=400, detail="status must be 'active' or 'idle'")
+    db_path = _get_kanban_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        result = conn.execute(
+            "UPDATE agent_status SET status = ?, updated_at = unixepoch() WHERE ministry_slug = ?",
+            (body.status, slug),
+        ).rowcount
+        conn.commit()
+        conn.close()
+        if result == 0:
+            raise HTTPException(status_code=404, detail=f"Ministry '{slug}' not found")
+        return {"ok": True, "ministry_slug": slug, "status": body.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Profile management endpoints (minimal — list/create/rename/delete + SOUL.md)
 # ---------------------------------------------------------------------------
 

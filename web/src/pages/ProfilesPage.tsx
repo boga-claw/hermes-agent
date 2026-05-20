@@ -17,7 +17,7 @@ import {
 import spinners from "unicode-animations";
 import { H2 } from "@/components/NouiTypography";
 import { api } from "@/lib/api";
-import type { ProfileInfo } from "@/lib/api";
+import type { AgentStatus, ProfileInfo } from "@/lib/api";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import { useToast } from "@/hooks/useToast";
 import { useConfirmDelete } from "@/hooks/useConfirmDelete";
@@ -94,6 +94,17 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
+
+  // Agent status polling
+  const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentStatus>>({});
+  useEffect(() => {
+    const poll = () => {
+      api.getAgentStatus().then(setAgentStatuses).catch(() => {});
+    };
+    poll();
+    const id = window.setInterval(poll, AGENT_STATUS_POLL_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, []);
 
   const load = useCallback(() => {
     api
@@ -410,6 +421,15 @@ export default function ProfilesPage() {
                     {p.has_env && (
                       <Badge tone="outline">{t.profiles.hasEnv}</Badge>
                     )}
+                    {(() => {
+                      const ag = agentStatuses[p.name];
+                      if (!ag) return null;
+                      const STALE_THRESHOLD_S = 30 * 60;
+                      const isStale = ag.status === "active" && (Date.now() / 1000 - ag.updated_at) > STALE_THRESHOLD_S;
+                      if (isStale) return <span title="Active but stale" className="inline-block w-2 h-2 rounded-full bg-yellow-500" />;
+                      if (ag.status === "active") return <span title="Active" className="relative inline-block w-2 h-2 rounded-full bg-green-500 animate-pulse" />;
+                      return <span title="Idle" className="inline-block w-2 h-2 rounded-full bg-gray-400" />;
+                    })()}
                   </div>
                   {isRenaming &&
                     (() => {
