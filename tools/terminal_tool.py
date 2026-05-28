@@ -3,12 +3,13 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Vercel Sandbox environments. Supports local
-execution, containerized backends, and cloud sandboxes, including managed
-Modal mode.
+Singularity, Daytona, Vercel Sandbox, and Claude Code environments. Supports local
+execution, containerized backends, cloud sandboxes, managed Modal mode, and
+task delegation to Claude Code CLI.
 
 Environment Selection (via TERMINAL_ENV environment variable):
 - "local": Execute directly on the host machine (default, fastest)
+- "claude_code": Delegate tasks to Claude Code CLI --bare -p (agentic, non-interactive)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
 - "vercel_sandbox": Execute in Vercel Sandbox cloud sandboxes
@@ -889,6 +890,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
+from tools.environments.claude_code import ClaudeCodeEnvironment as _ClaudeCodeEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
 
@@ -1137,7 +1139,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
-    
+
+    elif env_type == "claude_code":
+        return _ClaudeCodeEnvironment(cwd=cwd, timeout=timeout)
+
     elif env_type == "docker":
         return _DockerEnvironment(
             image=image, cwd=cwd, timeout=timeout,
@@ -1249,7 +1254,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
     else:
         raise ValueError(
-            f"Unknown environment type: {env_type}. Use 'local', 'docker', "
+            f"Unknown environment type: {env_type}. Use 'local', 'claude_code', 'docker', "
             f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
         )
 
