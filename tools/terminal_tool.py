@@ -3,18 +3,19 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and Vercel Sandbox environments. Supports local
-execution, containerized backends, and cloud sandboxes, including managed
-Modal mode.
+Singularity, Daytona, Vercel Sandbox, and OpenCode environments. Supports
+local execution, containerized backends, cloud sandboxes, managed Modal
+mode, and autonomous AI coding via OpenCode.
 
 Environment Selection (via TERMINAL_ENV environment variable):
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
 - "vercel_sandbox": Execute in Vercel Sandbox cloud sandboxes
+- "opencode": Execute autonomous coding tasks via the OpenCode CLI
 
 Features:
-- Multiple execution backends (local, docker, modal, vercel_sandbox)
+- Multiple execution backends (local, docker, modal, vercel_sandbox, opencode)
 - Background task support
 - VM/container lifecycle management
 - Automatic cleanup after inactivity
@@ -889,6 +890,7 @@ from tools.environments.ssh import SSHEnvironment as _SSHEnvironment
 from tools.environments.docker import DockerEnvironment as _DockerEnvironment
 from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
+from tools.environments.opencode import OpenCodeEnvironment as _OpenCodeEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
 
@@ -1017,7 +1019,7 @@ def _get_env_config() -> Dict[str, Any]:
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, Vercel uses its documented workspace root, and everything
     # else starts in the backend's default root-like cwd.
-    if env_type == "local":
+    if env_type == "local" or env_type == "opencode":
         default_cwd = os.getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
@@ -1113,7 +1115,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "vercel_sandbox", "ssh"
+            "daytona", "vercel_sandbox", "ssh", "opencode"
         image: Docker/Singularity/Modal image name (ignored for local/ssh/vercel)
         cwd: Working directory
         timeout: Default command timeout
@@ -1247,10 +1249,17 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "opencode":
+        return _OpenCodeEnvironment(
+            cwd=cwd,
+            timeout=timeout,
+            env=local_config if local_config else None,
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'vercel_sandbox', 'ssh', or 'opencode'"
         )
 
 
@@ -1826,7 +1835,7 @@ def terminal_tool(
                             }
 
                         local_config = None
-                        if env_type == "local":
+                        if env_type in ("local", "opencode"):
                             local_config = {
                                 "persistent": config.get("local_persistent", False),
                             }
@@ -1929,7 +1938,7 @@ def terminal_tool(
             session_key = get_current_session_key(default="")
             effective_cwd = workdir or cwd
             try:
-                if env_type == "local":
+                if env_type in ("local", "opencode"):
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
@@ -2157,6 +2166,13 @@ def check_terminal_requirements() -> bool:
         env_type = config["env_type"]
 
         if env_type == "local":
+            return True
+
+        elif env_type == "opencode":
+            from tools.environments.opencode import _find_opencode
+            if not _find_opencode():
+                logger.error("opencode binary not found in PATH")
+                return False
             return True
 
         elif env_type == "docker":
